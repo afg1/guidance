@@ -1,14 +1,33 @@
 import os
+import random
+import time
+
 from typing import Set, Optional, Protocol
 
 import pytest
 
 import guidance
 from guidance import models
-from guidance._grammar import GrammarFunction, Join
+from guidance._ast import GrammarNode
 from guidance._parser import ByteParserException
 
 opanai_model_cache = {}
+
+def slowdown():
+    """Limit test execution rate
+
+    Any test calling this function will have a
+    random delay inserted before the test runs.
+    It can be used as a crude rate limiter for
+    tests which call external APIs
+    """
+    delay_secs = random.randint(10, 30)
+    time.sleep(delay_secs)
+    return delay_secs
+
+
+def remote_image_url():
+    return "https://picsum.photos/300/200"
 
 
 def env_or_fail(var_name: str) -> str:
@@ -33,13 +52,6 @@ def get_model(model_name, caching=False, **kwargs):
         return get_transformers_model(model_name[13:], caching, **kwargs)
     elif model_name.startswith("llama_cpp:"):
         return get_llama_cpp_model(model_name[10:], caching, **kwargs)
-    elif model_name.startswith("azure_guidance:"):
-        return get_azure_guidance_model(model_name[15:], caching, **kwargs)
-    elif model_name.startswith("huggingface_hubllama"):
-        name_parts = model_name.split(":")
-        return get_llama_hugging_face_model(
-            repo_id=name_parts[1], filename=name_parts[2], **kwargs
-        )
     else:
         raise ValueError(f"Could not parse '{model_name}'")
 
@@ -56,13 +68,6 @@ def get_openai_model(model_name, caching=False, **kwargs):
         )
     lm = opanai_model_cache[key]
 
-    return lm
-
-
-def get_llama_hugging_face_model(repo_id: str, filename: str, **kwargs):
-    from huggingface_hub import hf_hub_download
-    downloaded_file = hf_hub_download(repo_id=repo_id, filename=filename)
-    lm = guidance.models.LlamaCpp(downloaded_file, **kwargs)
     return lm
 
 
@@ -113,38 +118,10 @@ def get_llama_cpp_model(model_name, caching=False, **kwargs):
     return llama_cpp_model_cache[key]
 
 
-azure_guidance_model_cache = {}
-azure_guidance_defaults = {}
-
-
-def get_azure_guidance_model(model_name, caching=False, **kwargs):
-    """Get Azure Guidance LLM with model reuse."""
-    # Base URL should look like:
-    #https://<MODEL_INFO>.models.ai.azure.com/guidance#auth=
-    base_url = env_or_fail("AZUREAI_GUIDANCE_ENABLED_URL")
-    api_key = env_or_fail("AZUREAI_GUIDANCE_ENABLED_URL_KEY")
-    model_name = base_url + api_key
-
-    kwargs = kwargs.copy()
-    for key, val in azure_guidance_defaults.items():
-        if key not in kwargs:
-            kwargs[key] = val
-
-    # we cache the models so lots of tests using the same model don't have to
-    # load it over and over again
-    key = model_name + "_" + str(caching) + "_" + str(kwargs)
-    if key not in azure_guidance_model_cache:
-        azure_guidance_model_cache[key] = guidance.models.AzureGuidance(
-            model_name, **kwargs
-        )
-
-    return azure_guidance_model_cache[key]
-
-
 def check_match_success_with_guards(grammar, test_string: str):
     PREFIX = "A#$!"
     SUFFIX = "&%@Z"
-    bracketed_grammar = Join([PREFIX, grammar, SUFFIX])
+    bracketed_grammar = PREFIX + grammar + SUFFIX
 
     bracketed_string = f"{PREFIX}{test_string}{SUFFIX}"
 
@@ -158,7 +135,7 @@ def check_match_failure(
     good_bytes: Optional[bytes] = None,
     failure_byte: Optional[bytes] = None,
     allowed_bytes: Optional[Set[bytes]] = None,
-    grammar: GrammarFunction,
+    grammar: GrammarNode,
 ):
     """
     Helper function to check that a string fails to match a grammar after consuming
@@ -176,17 +153,17 @@ def check_match_failure(
     if allowed_bytes is not None:
         assert pe.value.allowed_bytes == allowed_bytes
 
-class GrammarFunctionCallable(Protocol):
+class GrammarNodeCallable(Protocol):
     """
-    Protocol for a callable that returns a GrammarFunction and accepts
+    Protocol for a callable that returns a GrammarNode and accepts
     name argument for capture key
     """
 
-    def __call__(self, *args, name: str, **kwargs) -> GrammarFunction: ...
+    def __call__(self, *args, name: str, **kwargs) -> GrammarNode: ...
 
 
 def generate_and_check(
-    grammar_callable: GrammarFunctionCallable,
+    grammar_callable: GrammarNodeCallable,
     test_string: str,
     capture_key="my_capture",
     eos_token = "<s>",
